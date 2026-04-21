@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/grandcat/zeroconf"
@@ -139,7 +141,6 @@ func lockDevice() (string, bool) {
 		if err := exec.Command("loginctl", "lock-session").Run(); err != nil {
 			return "Lock failed: " + err.Error(), false
 		}
-	
 	}
 	return "Device locked successfully", true
 }
@@ -170,7 +171,6 @@ func changeDefaultWallpaper() (string, bool) {
 		if err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file:///usr/share/backgrounds/warty-final-ubuntu.png").Run(); err != nil {
 			return "Wallpaper change failed: " + err.Error(), false
 		}
-
 	}
 	return "Wallpaper changed to default successfully", true
 }
@@ -190,7 +190,6 @@ func applyWallpaper(path string) (string, bool) {
 		if err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file://"+path).Run(); err != nil {
 			return "Wallpaper failed: " + err.Error(), false
 		}
-	
 	default:
 		return fmt.Sprintf("Unsupported OS: %s", runtime.GOOS), false
 	}
@@ -218,25 +217,102 @@ func runShell(command string) (string, bool) {
 	return string(output), true
 }
 
+// ─── Network helpers ──────────────────────────────────────────────────────────
+
+// isVirtualInterface returns true for known virtual/tunnel adapters that
+// should NOT be used for mDNS advertisement.
+func isVirtualInterface(name string) bool {
+	lower := strings.ToLower(name)
+	virtual := []string{
+		"vbox", "vmware", "vmnet", "virtual", "virbr",
+		"docker", "br-", "veth", "tun", "tap", "lo",
+		"utun", "awdl", "llw", "anpi",
+	}
+	for _, v := range virtual {
+		if strings.Contains(lower, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// getRealInterfaces returns only physical/Wi-Fi interfaces that are up and
+// have an IPv4 address, excluding loopback and known virtual adapters.
+func getRealInterfaces() []net.Interface {
+	all, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+
+	var result []net.Interface
+	for _, iface := range all {
+		// Must be up
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		// Skip loopback
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		// Skip virtual adapters
+		if isVirtualInterface(iface.Name) {
+			continue
+		}
+		// Must have at least one IPv4 address
+		addrs, _ := iface.Addrs()
+		hasIPv4 := false
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil && !ip.IsLoopback() {
+				hasIPv4 = true
+				break
+			}
+		}
+		if hasIPv4 {
+			result = append(result, iface)
+		}
+	}
+	return result
+}
+
 // ─── mDNS registration ────────────────────────────────────────────────────────
 
 // registerMDNS advertises this agent on the local network so the controller
 // can discover it without any hardcoded IPs.
-// The instance name is the agentID (e.g. "Agent-1010").
-// Returns a cleanup function — call it on shutdown.
+// Only binds to real physical/Wi-Fi interfaces — skips VirtualBox, VMware, Docker, etc.
 func registerMDNS(port int) (func(), error) {
 	hostname, _ := os.Hostname()
+
+	ifaces := getRealInterfaces()
+	if len(ifaces) == 0 {
+		return nil, fmt.Errorf("no suitable network interfaces found")
+	}
+
+	// Log which interfaces will be used
+	names := make([]string, len(ifaces))
+	for i, iface := range ifaces {
+		names[i] = iface.Name
+	}
+	fmt.Printf("[%s] mDNS binding to interfaces: %s\n", agentID, strings.Join(names, ", "))
+
 	server, err := zeroconf.Register(
-		agentID,      // instance name   → shown as Agent.ID on the controller
-		mdnsService,  // service type
-		mdnsDomain,   // domain
-		port,         // port
+		agentID,               // instance name → shown as Agent.ID on the controller
+		mdnsService,           // service type
+		mdnsDomain,            // domain
+		port,                  // port
 		[]string{"version=1"}, // TXT records (optional metadata)
-		nil,          // bind to all interfaces
+		ifaces,                // bind only to real interfaces
 	)
 	if err != nil {
 		return nil, err
 	}
+
 	fmt.Printf("[%s] mDNS registered as %q on %s:%d\n", agentID, agentID, hostname, port)
 	return func() { server.Shutdown() }, nil
 }

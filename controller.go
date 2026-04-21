@@ -93,8 +93,6 @@ func refreshAgents(timeout time.Duration) []Agent {
 	return agents
 }
 
-// ─── Core HTTP helpers ────────────────────────────────────────────────────────
-
 func sendCommand(agent Agent, endpoint, cmd string) CommandResponse {
 	url := agent.BaseURL() + "/" + endpoint
 	resp, err := http.Post(url, "text/plain", bytes.NewBufferString(cmd))
