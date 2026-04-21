@@ -1,370 +1,233 @@
 package main
 
 import (
+	"bufio"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
-	"io"
+	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
-	"syscall"
-
-	"github.com/grandcat/zeroconf"
+	"time"
 )
 
-// CommandResponse is the structure sent back to the controller
-type CommandResponse struct {
-	Agent   string `json:"agent"`
-	Command string `json:"command"`
-	Output  string `json:"output"`
-	Success bool   `json:"success"`
+type Request struct {
+	Command       string `json:"command"`
+	Wallpaper     string `json:"wallpaper,omitempty"`
+	WallpaperName string `json:"wallpaper_name,omitempty"`
+	WallpaperData string `json:"wallpaper_data,omitempty"`
 }
 
-var agentID string
-
-const mdnsService = "_distcontrol._tcp"
-const mdnsDomain = "local."
-
-// ─── Shared response helper ───────────────────────────────────────────────────
-
-func respond(w http.ResponseWriter, cmd, output string, success bool) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CommandResponse{
-		Agent:   agentID,
-		Command: cmd,
-		Output:  output,
-		Success: success,
-	})
+type Response struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
+func main() {
+	controllerAddr := flag.String("controller", "10.251.91.88:9000", "controller address")
+	name := flag.String("name", "", "optional device name")
+	flag.Parse()
 
-func commandHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
-		return
+	deviceName := strings.TrimSpace(*name)
+	if deviceName == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			deviceName = "unknown-device"
+		} else {
+			deviceName = host
+		}
 	}
 
-	body, err := io.ReadAll(r.Body)
+	for {
+		if err := runAgent(*controllerAddr, deviceName); err != nil {
+			log.Printf("connection lost: %v", err)
+		}
+
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func runAgent(controllerAddr, deviceName string) error {
+	conn, err := net.Dial("tcp", controllerAddr)
 	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
-		return
+		return err
+	}
+	defer conn.Close()
+
+	log.Printf("connected to controller %s as %s", controllerAddr, deviceName)
+
+	if err := json.NewEncoder(conn).Encode(map[string]string{"name": deviceName}); err != nil {
+		return err
 	}
 
-	command := string(body)
-	fmt.Printf("[%s] Received command: %s\n", agentID, command)
+	reader := bufio.NewReader(conn)
+	decoder := json.NewDecoder(reader)
+	encoder := json.NewEncoder(conn)
 
-	output, success := executeCommand(command)
-	respond(w, command, output, success)
+	for {
+		var req Request
+		if err := decoder.Decode(&req); err != nil {
+			return err
+		}
+
+		resp := Response{OK: true, Message: "command executed successfully"}
+		if err := executeCommand(req); err != nil {
+			resp.OK = false
+			resp.Message = err.Error()
+		}
+
+		if err := encoder.Encode(resp); err != nil {
+			return err
+		}
+	}
 }
 
-func terminalHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
-		return
-	}
-
-	shellCmd := string(body)
-	fmt.Printf("[%s] Terminal command: %s\n", agentID, shellCmd)
-
-	output, success := runShell(shellCmd)
-	respond(w, shellCmd, output, success)
-}
-
-// wallpaperHandler receives raw image bytes from the controller, saves them to
-// a temporary file, then applies the image as the desktop wallpaper.
-func wallpaperHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
-		return
-	}
-
-	if len(data) == 0 {
-		respond(w, "wallpaper", "ERROR: received empty image data", false)
-		return
-	}
-
-	tmpFile := filepath.Join(os.TempDir(), "agent_wallpaper.jpg")
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
-		respond(w, "wallpaper", "Failed to save image: "+err.Error(), false)
-		return
-	}
-
-	fmt.Printf("[%s] Wallpaper saved to %s (%d bytes)\n", agentID, tmpFile, len(data))
-
-	output, success := applyWallpaper(tmpFile)
-	respond(w, "wallpaper", output, success)
-}
-
-// ─── Command implementations ──────────────────────────────────────────────────
-
-func executeCommand(command string) (string, bool) {
-	switch command {
+func executeCommand(req Request) error {
+	switch strings.ToLower(strings.TrimSpace(req.Command)) {
 	case "lock":
 		return lockDevice()
 	case "shutdown":
 		return shutdownDevice()
 	case "wallpaper":
-		return changeDefaultWallpaper()
-	case "info":
-		return getSystemInfo()
+		if strings.TrimSpace(req.WallpaperData) == "" {
+			return errors.New("wallpaper image data is required for wallpaper command")
+		}
+		return saveAndSetWallpaper(req)
 	default:
-		return fmt.Sprintf("Unknown command: %s", command), false
+		return fmt.Errorf("unsupported command: %s", req.Command)
 	}
 }
 
-func lockDevice() (string, bool) {
-	switch runtime.GOOS {
-	case "windows":
-		if err := exec.Command("rundll32.exe", "user32.dll,LockWorkStation").Run(); err != nil {
-			return "Lock failed: " + err.Error(), false
-		}
-	case "linux":
-		if err := exec.Command("loginctl", "lock-session").Run(); err != nil {
-			return "Lock failed: " + err.Error(), false
-		}
-	}
-	return "Device locked successfully", true
-}
-
-func shutdownDevice() (string, bool) {
-	var err error
-	switch runtime.GOOS {
-	case "windows":
-		err = exec.Command("shutdown", "/s", "/t", "0").Run()
-	case "linux", "darwin":
-		err = exec.Command("shutdown", "-h", "now").Run()
-	}
+func saveAndSetWallpaper(req Request) error {
+	imageBytes, err := base64.StdEncoding.DecodeString(req.WallpaperData)
 	if err != nil {
-		return "Shutdown failed: " + err.Error(), false
+		return fmt.Errorf("failed to decode wallpaper: %w", err)
 	}
-	return "Shutting down...", true
+
+	fileName := strings.TrimSpace(req.WallpaperName)
+	if fileName == "" {
+		fileName = "wallpaper.jpg"
+	}
+
+	targetPath := filepath.Join(os.TempDir(), "distributed-controller-"+filepath.Base(fileName))
+	if err := os.WriteFile(targetPath, imageBytes, 0644); err != nil {
+		return fmt.Errorf("failed to save wallpaper: %w", err)
+	}
+
+	return changeWallpaper(targetPath)
 }
 
-// changeDefaultWallpaper applies a built-in OS wallpaper (legacy string command).
-func changeDefaultWallpaper() (string, bool) {
+func lockDevice() error {
 	switch runtime.GOOS {
 	case "windows":
-		script := `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class Wallpaper{[DllImport("user32.dll")]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'; [Wallpaper]::SystemParametersInfo(20,0,"C:\Windows\Web\Wallpaper\Windows\img0.jpg",3)`
-		if err := exec.Command("powershell", "-Command", script).Run(); err != nil {
-			return "Wallpaper change failed: " + err.Error(), false
-		}
+		return exec.Command("rundll32.exe", "user32.dll,LockWorkStation").Run()
 	case "linux":
-		if err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file:///usr/share/backgrounds/warty-final-ubuntu.png").Run(); err != nil {
-			return "Wallpaper change failed: " + err.Error(), false
-		}
-	}
-	return "Wallpaper changed to default successfully", true
-}
-
-// applyWallpaper sets the desktop wallpaper to the given local file path.
-func applyWallpaper(path string) (string, bool) {
-	switch runtime.GOOS {
-	case "windows":
-		script := fmt.Sprintf(
-			`Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'; [W]::SystemParametersInfo(20,0,"%s",3)`,
-			path,
-		)
-		if err := exec.Command("powershell", "-Command", script).Run(); err != nil {
-			return "Wallpaper failed: " + err.Error(), false
-		}
-	case "linux":
-		if err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file://"+path).Run(); err != nil {
-			return "Wallpaper failed: " + err.Error(), false
-		}
+		return exec.Command("loginctl", "lock-session").Run()
 	default:
-		return fmt.Sprintf("Unsupported OS: %s", runtime.GOOS), false
+		return fmt.Errorf("lock is not implemented for %s", runtime.GOOS)
 	}
-	return fmt.Sprintf("Wallpaper applied successfully (%s)", path), true
 }
 
-func getSystemInfo() (string, bool) {
-	hostname, _ := os.Hostname()
-	return fmt.Sprintf("OS: %s | Arch: %s | Hostname: %s", runtime.GOOS, runtime.GOARCH, hostname), true
-}
-
-func runShell(command string) (string, bool) {
-	var cmd *exec.Cmd
+func shutdownDevice() error {
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/C", command)
+		return exec.Command("shutdown", "/s", "/t", "0").Run()
+	case "linux":
+		return exec.Command("shutdown", "now").Run()
+	case "darwin":
+		return exec.Command("sudo", "shutdown", "-h", "now").Run()
 	default:
-		cmd = exec.Command("sh", "-c", command)
+		return fmt.Errorf("shutdown is not implemented for %s", runtime.GOOS)
 	}
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Sprintf("Error: %s\nOutput: %s", err.Error(), string(output)), false
-	}
-	return string(output), true
 }
 
-// ─── Network helpers ──────────────────────────────────────────────────────────
-
-// isVirtualInterface returns true for known virtual/tunnel adapters that
-// should NOT be used for mDNS advertisement.
-func isVirtualInterface(name string) bool {
-	lower := strings.ToLower(name)
-	virtual := []string{
-		"vbox", "vmware", "vmnet", "virtual", "virbr",
-		"docker", "br-", "veth", "tun", "tap", "lo",
-		"utun", "awdl", "llw", "anpi",
+func changeWallpaper(path string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return changeWallpaperWindows(path)
+	case "linux":
+		return changeWallpaperLinux(path)
+	default:
+		return fmt.Errorf("wallpaper change is not implemented for %s", runtime.GOOS)
 	}
-	for _, v := range virtual {
-		if strings.Contains(lower, v) {
-			return true
-		}
-	}
-	return false
 }
 
-// getRealInterfaces returns only physical/Wi-Fi interfaces that are up and
-// have an IPv4 address, excluding loopback and known virtual adapters.
-func getRealInterfaces() []net.Interface {
-	all, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-
-	var result []net.Interface
-	for _, iface := range all {
-		// Must be up
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		// Skip loopback
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		// Skip virtual adapters
-		if isVirtualInterface(iface.Name) {
-			continue
-		}
-		// Must have at least one IPv4 address
-		addrs, _ := iface.Addrs()
-		hasIPv4 := false
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil && ip.To4() != nil && !ip.IsLoopback() {
-				hasIPv4 = true
-				break
-			}
-		}
-		if hasIPv4 {
-			result = append(result, iface)
-		}
-	}
-	return result
+func changeWallpaperWindows(path string) error {
+	script := fmt.Sprintf(
+		`Add-Type @"
+using System.Runtime.InteropServices;
+public class Wallpaper {
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
 }
-
-// ─── mDNS registration ────────────────────────────────────────────────────────
-
-// registerMDNS advertises this agent on the local network so the controller
-// can discover it without any hardcoded IPs.
-// Only binds to real physical/Wi-Fi interfaces — skips VirtualBox, VMware, Docker, etc.
-func registerMDNS(port int) (func(), error) {
-	hostname, _ := os.Hostname()
-
-	ifaces := getRealInterfaces()
-	if len(ifaces) == 0 {
-		return nil, fmt.Errorf("no suitable network interfaces found")
-	}
-
-	// Log which interfaces will be used
-	names := make([]string, len(ifaces))
-	for i, iface := range ifaces {
-		names[i] = iface.Name
-	}
-	fmt.Printf("[%s] mDNS binding to interfaces: %s\n", agentID, strings.Join(names, ", "))
-
-	server, err := zeroconf.Register(
-		agentID,               // instance name → shown as Agent.ID on the controller
-		mdnsService,           // service type
-		mdnsDomain,            // domain
-		port,                  // port
-		[]string{"version=1"}, // TXT records (optional metadata)
-		ifaces,                // bind only to real interfaces
+"@; [Wallpaper]::SystemParametersInfo(20, 0, "%s", 3)`,
+		escapeForPowerShell(path),
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("[%s] mDNS registered as %q on %s:%d\n", agentID, agentID, hostname, port)
-	return func() { server.Shutdown() }, nil
+	return exec.Command("powershell", "-NoProfile", "-Command", script).Run()
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
+func changeWallpaperLinux(path string) error {
+	fileURI := "file://" + filepath.ToSlash(path)
 
-func main() {
-	portStr := "1010"
-	if len(os.Args) > 1 {
-		portStr = os.Args[1]
+	commands := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "gsettings",
+			args: []string{"set", "org.gnome.desktop.background", "picture-uri", fileURI},
+		},
+		{
+			name: "gsettings",
+			args: []string{"set", "org.gnome.desktop.background", "picture-uri-dark", fileURI},
+		},
+		{
+			name: "gsettings",
+			args: []string{"set", "org.cinnamon.desktop.background", "picture-uri", fileURI},
+		},
+		{
+			name: "gsettings",
+			args: []string{"set", "org.mate.background", "picture-filename", path},
+		},
+		{
+			name: "xfconf-query",
+			args: []string{"-c", "xfce4-desktop", "-p", "/backdrop/screen0/monitor0/image-path", "-s", path},
+		},
+		{
+			name: "xfconf-query",
+			args: []string{"-c", "xfce4-desktop", "-p", "/backdrop/screen0/monitor0/workspace0/last-image", "-s", path},
+		},
+		{
+			name: "feh",
+			args: []string{"--bg-fill", path},
+		},
 	}
 
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		fmt.Println("Invalid port:", portStr)
-		os.Exit(1)
-	}
-
-	agentID = "Agent-" + portStr
-
-	stopMDNS, err := registerMDNS(port)
-	if err != nil {
-		fmt.Printf("[%s] WARNING: mDNS registration failed: %v\n", agentID, err)
-	} else {
-		defer stopMDNS()
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/command", commandHandler)
-	mux.HandleFunc("/terminal", terminalHandler)
-	mux.HandleFunc("/wallpaper", wallpaperHandler)
-
-	fmt.Printf("[%s] Agent running on port %d\n", agentID, port)
-
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		fmt.Printf("\n[%s] Shutting down...\n", agentID)
-		if stopMDNS != nil {
-			stopMDNS()
+	var attempted []string
+	for _, command := range commands {
+		if _, err := exec.LookPath(command.name); err != nil {
+			continue
 		}
-		os.Exit(0)
-	}()
 
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		attempted = append(attempted, command.name)
+		if err := exec.Command(command.name, command.args...).Run(); err == nil {
+			return nil
+		}
 	}
 
-	if err := server.ListenAndServe(); err != nil {
-		fmt.Println("Server error:", err)
-		os.Exit(1)
+	if len(attempted) == 0 {
+		return errors.New("no supported Linux wallpaper tool found (tried gsettings, xfconf-query, feh)")
 	}
+
+	return fmt.Errorf("failed to change wallpaper with available Linux tools: %s", strings.Join(attempted, ", "))
+}
+
+func escapeForPowerShell(value string) string {
+	return strings.ReplaceAll(value, `"`, "`\"")
 }
