@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/grandcat/zeroconf"
 )
 
 // CommandResponse matches the agent's response struct
@@ -18,27 +22,85 @@ type CommandResponse struct {
 	Agent   string `json:"agent"`
 	Command string `json:"command"`
 	Output  string `json:"output"`
-	Success bool `json:"success"`
+	Success bool   `json:"success"`
 }
 
-// Known agents (port numbers)
-var agents = []string{
-	"1010",
-	"1011",
-	"1012",
-	"1013",
+// Agent holds a discovered agent's address info
+type Agent struct {
+	ID   string // e.g. "Agent-1010"
+	Host string // IP address
+	Port int
 }
 
-const baseURL = "http://localhost:"
+func (a Agent) BaseURL() string {
+	return fmt.Sprintf("http://%s:%d", a.Host, a.Port)
+}
+
+const mdnsService = "_distcontrol._tcp"
+const mdnsDomain = "local."
+
+// ─── mDNS Discovery ───────────────────────────────────────────────────────────
+
+// discoverAgents browses the local network for agents advertising via mDNS.
+// It waits up to `timeout` for responses, then returns all found agents.
+func discoverAgents(timeout time.Duration) []Agent {
+	resolver, err := zeroconf.NewResolver(nil)
+	if err != nil {
+		fmt.Println("ERROR: failed to create mDNS resolver:", err)
+		return nil
+	}
+
+	entries := make(chan *zeroconf.ServiceEntry)
+	var agents []Agent
+	var mu sync.Mutex
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	go func() {
+		for entry := range entries {
+			if len(entry.AddrIPv4) == 0 {
+				continue
+			}
+			mu.Lock()
+			agents = append(agents, Agent{
+				ID:   entry.Instance,
+				Host: entry.AddrIPv4[0].String(),
+				Port: entry.Port,
+			})
+			mu.Unlock()
+		}
+	}()
+
+	if err := resolver.Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+		fmt.Println("ERROR: mDNS browse failed:", err)
+		return nil
+	}
+
+	<-ctx.Done()
+	return agents
+}
+
+// refreshAgents discovers agents and prints the result.
+func refreshAgents(timeout time.Duration) []Agent {
+	fmt.Printf("Scanning network for agents (%.0fs)...\n", timeout.Seconds())
+	agents := discoverAgents(timeout)
+	if len(agents) == 0 {
+		fmt.Println("No agents found.")
+	} else {
+		fmt.Printf("Found %d agent(s).\n", len(agents))
+	}
+	return agents
+}
 
 // ─── Core HTTP helpers ────────────────────────────────────────────────────────
 
-func sendCommand(port, endpoint, cmd string) CommandResponse {
-	url := baseURL + port + "/" + endpoint
+func sendCommand(agent Agent, endpoint, cmd string) CommandResponse {
+	url := agent.BaseURL() + "/" + endpoint
 	resp, err := http.Post(url, "text/plain", bytes.NewBufferString(cmd))
 	if err != nil {
 		return CommandResponse{
-			Agent:   "Agent-" + port,
+			Agent:   agent.ID,
 			Command: cmd,
 			Output:  "ERROR: " + err.Error(),
 			Success: false,
@@ -50,9 +112,8 @@ func sendCommand(port, endpoint, cmd string) CommandResponse {
 
 	var result CommandResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		// Fallback for plain text responses
 		result = CommandResponse{
-			Agent:   "Agent-" + port,
+			Agent:   agent.ID,
 			Command: cmd,
 			Output:  string(body),
 			Success: true,
@@ -61,38 +122,83 @@ func sendCommand(port, endpoint, cmd string) CommandResponse {
 	return result
 }
 
-func sendToAll(endpoint, cmd string) {
+func sendToAll(agents []Agent, endpoint, cmd string) {
 	var wg sync.WaitGroup
 	results := make([]CommandResponse, len(agents))
 
-	for i, port := range agents {
+	for i, agent := range agents {
 		wg.Add(1)
-		go func(idx int, p string) {
+		go func(idx int, a Agent) {
 			defer wg.Done()
-			results[idx] = sendCommand(p, endpoint, cmd)
-		}(i, port)
+			results[idx] = sendCommand(a, endpoint, cmd)
+		}(i, agent)
 	}
 
 	wg.Wait()
 	printResults(results)
 }
 
-func sendToMany(ports []string, endpoint, cmd string) {
+func sendToMany(targets []Agent, endpoint, cmd string) {
 	var wg sync.WaitGroup
-	results := make([]CommandResponse, len(ports))
+	results := make([]CommandResponse, len(targets))
 
-	for i, port := range ports {
+	for i, agent := range targets {
 		wg.Add(1)
-		go func(idx int, p string) {
+		go func(idx int, a Agent) {
 			defer wg.Done()
-			results[idx] = sendCommand(p, endpoint, cmd)
-		}(i, port)
+			results[idx] = sendCommand(a, endpoint, cmd)
+		}(i, agent)
 	}
 
 	wg.Wait()
 	printResults(results)
 }
 
+// sendWallpaperFile reads an image from disk and sends raw bytes to /wallpaper
+// on each target agent in parallel.
+func sendWallpaperFile(targets []Agent, imagePath string) {
+	data, err := os.ReadFile(imagePath)
+	if err != nil {
+		fmt.Println("ERROR reading file:", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	results := make([]CommandResponse, len(targets))
+
+	for i, agent := range targets {
+		wg.Add(1)
+		go func(idx int, a Agent) {
+			defer wg.Done()
+			url := a.BaseURL() + "/wallpaper"
+			resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(data))
+			if err != nil {
+				results[idx] = CommandResponse{
+					Agent:   a.ID,
+					Command: "wallpaper",
+					Output:  "ERROR: " + err.Error(),
+					Success: false,
+				}
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			var r CommandResponse
+			if err := json.Unmarshal(body, &r); err != nil {
+				r = CommandResponse{
+					Agent:   a.ID,
+					Command: "wallpaper",
+					Output:  string(body),
+					Success: true,
+				}
+			}
+			results[idx] = r
+		}(i, agent)
+	}
+
+	wg.Wait()
+	printResults(results)
+}
 
 func printResults(results []CommandResponse) {
 	fmt.Println()
@@ -109,20 +215,24 @@ func printResults(results []CommandResponse) {
 	}
 }
 
-func printAgentList() {
-	fmt.Println("─────────────────────────────")
-	for i, port := range agents {
-		fmt.Printf("  %d. Agent-%s (port %s)\n", i+1, port, port)
+func printAgentList(agents []Agent) {
+	fmt.Println("─────────────────────────────────────────────")
+	if len(agents) == 0 {
+		fmt.Println("  (no agents — press R at main menu to rescan)")
 	}
-	fmt.Println("─────────────────────────────")
+	for i, a := range agents {
+		fmt.Printf("  %d. %s  [%s:%d]\n", i+1, a.ID, a.Host, a.Port)
+	}
+	fmt.Println("─────────────────────────────────────────────")
 }
 
+// ─── Command picker ───────────────────────────────────────────────────────────
 
 func pickBuiltinCommand(reader *bufio.Reader) (string, bool) {
 	fmt.Println("\nChoose command:")
 	fmt.Println("  1. Lock")
 	fmt.Println("  2. Shutdown")
-	fmt.Println("  3. Change Wallpaper")
+	fmt.Println("  3. Change Wallpaper (send image from this device)")
 	fmt.Println("  4. Get System Info")
 	fmt.Println("  5. Terminal (custom shell command)")
 	fmt.Println("  0. Back")
@@ -138,11 +248,15 @@ func pickBuiltinCommand(reader *bufio.Reader) (string, bool) {
 	commands := map[int]string{
 		1: "lock",
 		2: "shutdown",
-		3: "wallpaper",
 		4: "info",
 	}
 
-	if c == 5 {
+	switch c {
+	case 3:
+		fmt.Print("Enter image path on your device: ")
+		path, _ := reader.ReadString('\n')
+		return "WALLPAPER:" + strings.TrimSpace(path), true
+	case 5:
 		fmt.Print("Enter shell command: ")
 		cmd, _ := reader.ReadString('\n')
 		return "TERMINAL:" + strings.TrimSpace(cmd), true
@@ -152,10 +266,14 @@ func pickBuiltinCommand(reader *bufio.Reader) (string, bool) {
 	return cmd, ok
 }
 
+// ─── Target selectors ─────────────────────────────────────────────────────────
 
-func oneAgent(reader *bufio.Reader) {
+func oneAgent(reader *bufio.Reader, agents []Agent) {
 	fmt.Println("\n====== One Agent ======")
-	printAgentList()
+	printAgentList(agents)
+	if len(agents) == 0 {
+		return
+	}
 	fmt.Print("Choose agent number: ")
 
 	input, _ := reader.ReadString('\n')
@@ -166,34 +284,41 @@ func oneAgent(reader *bufio.Reader) {
 		return
 	}
 
-	port := agents[idx-1]
-	fmt.Printf("\nSelected: Agent-%s\n", port)
+	target := agents[idx-1]
+	fmt.Printf("\nSelected: %s (%s:%d)\n", target.ID, target.Host, target.Port)
 
 	cmd, ok := pickBuiltinCommand(reader)
 	if !ok {
 		return
 	}
 
+	if strings.HasPrefix(cmd, "WALLPAPER:") {
+		sendWallpaperFile([]Agent{target}, strings.TrimPrefix(cmd, "WALLPAPER:"))
+		return
+	}
+
 	var result CommandResponse
 	if strings.HasPrefix(cmd, "TERMINAL:") {
-		shellCmd := strings.TrimPrefix(cmd, "TERMINAL:")
-		result = sendCommand(port, "terminal", shellCmd)
+		result = sendCommand(target, "terminal", strings.TrimPrefix(cmd, "TERMINAL:"))
 	} else {
-		result = sendCommand(port, "command", cmd)
+		result = sendCommand(target, "command", cmd)
 	}
 	printResults([]CommandResponse{result})
 }
 
-func moreAgents(reader *bufio.Reader) {
+func moreAgents(reader *bufio.Reader, agents []Agent) {
 	fmt.Println("\n====== Multiple Agents ======")
-	printAgentList()
+	printAgentList(agents)
+	if len(agents) == 0 {
+		return
+	}
 	fmt.Print("Enter agent numbers separated by commas (e.g. 1,3): ")
 
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
 	parts := strings.Split(input, ",")
 
-	var selectedPorts []string
+	var selected []Agent
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		idx, err := strconv.Atoi(p)
@@ -201,49 +326,65 @@ func moreAgents(reader *bufio.Reader) {
 			fmt.Printf("  Skipping invalid: %s\n", p)
 			continue
 		}
-		selectedPorts = append(selectedPorts, agents[idx-1])
+		selected = append(selected, agents[idx-1])
 	}
 
-	if len(selectedPorts) == 0 {
+	if len(selected) == 0 {
 		fmt.Println("No valid agents selected.")
 		return
 	}
 
-	fmt.Printf("Targeting: %s\n", strings.Join(selectedPorts, ", "))
+	names := make([]string, len(selected))
+	for i, a := range selected {
+		names[i] = a.ID
+	}
+	fmt.Printf("Targeting: %s\n", strings.Join(names, ", "))
 
 	cmd, ok := pickBuiltinCommand(reader)
 	if !ok {
 		return
 	}
 
+	if strings.HasPrefix(cmd, "WALLPAPER:") {
+		sendWallpaperFile(selected, strings.TrimPrefix(cmd, "WALLPAPER:"))
+		return
+	}
 	if strings.HasPrefix(cmd, "TERMINAL:") {
-		shellCmd := strings.TrimPrefix(cmd, "TERMINAL:")
-		sendToMany(selectedPorts, "terminal", shellCmd)
+		sendToMany(selected, "terminal", strings.TrimPrefix(cmd, "TERMINAL:"))
 	} else {
-		sendToMany(selectedPorts, "command", cmd)
+		sendToMany(selected, "command", cmd)
 	}
 }
 
-func allAgents(reader *bufio.Reader) {
+func allAgents(reader *bufio.Reader, agents []Agent) {
 	fmt.Println("\n====== All Agents ======")
+	if len(agents) == 0 {
+		fmt.Println("No agents available.")
+		return
+	}
 
 	cmd, ok := pickBuiltinCommand(reader)
 	if !ok {
 		return
 	}
 
+	if strings.HasPrefix(cmd, "WALLPAPER:") {
+		sendWallpaperFile(agents, strings.TrimPrefix(cmd, "WALLPAPER:"))
+		return
+	}
 	if strings.HasPrefix(cmd, "TERMINAL:") {
-		shellCmd := strings.TrimPrefix(cmd, "TERMINAL:")
-		sendToAll("terminal", shellCmd)
+		sendToAll(agents, "terminal", strings.TrimPrefix(cmd, "TERMINAL:"))
 	} else {
-		sendToAll("command", cmd)
+		sendToAll(agents, "command", cmd)
 	}
 }
 
-
-func terminalSession(reader *bufio.Reader) {
+func terminalSession(reader *bufio.Reader, agents []Agent) {
 	fmt.Println("\n====== Terminal Session ======")
-	printAgentList()
+	printAgentList(agents)
+	if len(agents) == 0 {
+		return
+	}
 	fmt.Println("  0. All agents")
 	fmt.Print("Choose agent (0 for all): ")
 
@@ -265,7 +406,7 @@ func terminalSession(reader *bufio.Reader) {
 		}
 
 		if input == "0" {
-			sendToAll("terminal", cmd)
+			sendToAll(agents, "terminal", cmd)
 		} else {
 			idx, err := strconv.Atoi(input)
 			if err != nil || idx < 1 || idx > len(agents) {
@@ -283,34 +424,37 @@ func terminalSession(reader *bufio.Reader) {
 func menu() {
 	reader := bufio.NewReader(os.Stdin)
 
+	// Initial discovery on startup
+	agents := refreshAgents(3 * time.Second)
+
 	for {
-		fmt.Println("\n╔══════════════════════════════╗")
-		fmt.Println("║     Distributed Controller   ║")
-		fmt.Println("╚══════════════════════════════╝")
+		fmt.Println("\n╔══════════════════════════════════╗")
+		fmt.Println("║     Distributed Controller       ║")
+		fmt.Printf("║     Agents found: %-14d║\n", len(agents))
+		fmt.Println("╚══════════════════════════════════╝")
 		fmt.Println("  1. One agent")
 		fmt.Println("  2. Multiple agents")
 		fmt.Println("  3. All agents")
 		fmt.Println("  4. Terminal session")
+		fmt.Println("  R. Rescan network")
 		fmt.Println("  0. Exit")
 		fmt.Print("> ")
 
 		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-		c, err := strconv.Atoi(input)
-		if err != nil {
-			continue
-		}
+		input = strings.TrimSpace(strings.ToLower(input))
 
-		switch c {
-		case 1:
-			oneAgent(reader)
-		case 2:
-			moreAgents(reader)
-		case 3:
-			allAgents(reader)
-		case 4:
-			terminalSession(reader)
-		case 0:
+		switch input {
+		case "1":
+			oneAgent(reader, agents)
+		case "2":
+			moreAgents(reader, agents)
+		case "3":
+			allAgents(reader, agents)
+		case "4":
+			terminalSession(reader, agents)
+		case "r":
+			agents = refreshAgents(3 * time.Second)
+		case "0":
 			fmt.Println("Goodbye.")
 			return
 		}

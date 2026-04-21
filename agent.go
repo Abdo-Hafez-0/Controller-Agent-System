@@ -7,10 +7,16 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"syscall"
+
+	"github.com/grandcat/zeroconf"
 )
 
-// Response structure sent back to master
+// CommandResponse is the structure sent back to the controller
 type CommandResponse struct {
 	Agent   string `json:"agent"`
 	Command string `json:"command"`
@@ -19,6 +25,23 @@ type CommandResponse struct {
 }
 
 var agentID string
+
+const mdnsService = "_distcontrol._tcp"
+const mdnsDomain = "local."
+
+// ─── Shared response helper ───────────────────────────────────────────────────
+
+func respond(w http.ResponseWriter, cmd, output string, success bool) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CommandResponse{
+		Agent:   agentID,
+		Command: cmd,
+		Output:  output,
+		Success: success,
+	})
+}
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
 
 func commandHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -36,16 +59,7 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("[%s] Received command: %s\n", agentID, command)
 
 	output, success := executeCommand(command)
-
-	resp := CommandResponse{
-		Agent:   agentID,
-		Command: command,
-		Output:  output,
-		Success: success,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	respond(w, command, output, success)
 }
 
 func terminalHandler(w http.ResponseWriter, r *http.Request) {
@@ -64,17 +78,41 @@ func terminalHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("[%s] Terminal command: %s\n", agentID, shellCmd)
 
 	output, success := runShell(shellCmd)
+	respond(w, shellCmd, output, success)
+}
 
-	resp := CommandResponse{
-		Agent:   agentID,
-		Command: shellCmd,
-		Output:  output,
-		Success: success,
+// wallpaperHandler receives raw image bytes from the controller, saves them to
+// a temporary file, then applies the image as the desktop wallpaper.
+func wallpaperHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	if len(data) == 0 {
+		respond(w, "wallpaper", "ERROR: received empty image data", false)
+		return
+	}
+
+	tmpFile := filepath.Join(os.TempDir(), "agent_wallpaper.jpg")
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		respond(w, "wallpaper", "Failed to save image: "+err.Error(), false)
+		return
+	}
+
+	fmt.Printf("[%s] Wallpaper saved to %s (%d bytes)\n", agentID, tmpFile, len(data))
+
+	output, success := applyWallpaper(tmpFile)
+	respond(w, "wallpaper", output, success)
 }
+
+// ─── Command implementations ──────────────────────────────────────────────────
 
 func executeCommand(command string) (string, bool) {
 	switch command {
@@ -83,7 +121,7 @@ func executeCommand(command string) (string, bool) {
 	case "shutdown":
 		return shutdownDevice()
 	case "wallpaper":
-		return changeWallpaper()
+		return changeDefaultWallpaper()
 	case "info":
 		return getSystemInfo()
 	default:
@@ -94,15 +132,14 @@ func executeCommand(command string) (string, bool) {
 func lockDevice() (string, bool) {
 	switch runtime.GOOS {
 	case "windows":
-		err := exec.Command("rundll32.exe", "user32.dll,LockWorkStation").Run()
-		if err != nil {
+		if err := exec.Command("rundll32.exe", "user32.dll,LockWorkStation").Run(); err != nil {
 			return "Lock failed: " + err.Error(), false
 		}
 	case "linux":
-		err := exec.Command("loginctl", "lock-session").Run()
-		if err != nil {
+		if err := exec.Command("loginctl", "lock-session").Run(); err != nil {
 			return "Lock failed: " + err.Error(), false
 		}
+	
 	}
 	return "Device locked successfully", true
 }
@@ -112,7 +149,7 @@ func shutdownDevice() (string, bool) {
 	switch runtime.GOOS {
 	case "windows":
 		err = exec.Command("shutdown", "/s", "/t", "0").Run()
-	case  "linux":
+	case "linux", "darwin":
 		err = exec.Command("shutdown", "-h", "now").Run()
 	}
 	if err != nil {
@@ -121,23 +158,43 @@ func shutdownDevice() (string, bool) {
 	return "Shutting down...", true
 }
 
-func changeWallpaper() (string, bool) {
-	// Placeholder - customize path as needed
+// changeDefaultWallpaper applies a built-in OS wallpaper (legacy string command).
+func changeDefaultWallpaper() (string, bool) {
 	switch runtime.GOOS {
 	case "windows":
 		script := `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class Wallpaper{[DllImport("user32.dll")]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'; [Wallpaper]::SystemParametersInfo(20,0,"C:\Windows\Web\Wallpaper\Windows\img0.jpg",3)`
-		err := exec.Command("powershell", "-Command", script).Run()
-		if err != nil {
+		if err := exec.Command("powershell", "-Command", script).Run(); err != nil {
 			return "Wallpaper change failed: " + err.Error(), false
 		}
 	case "linux":
-		err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file:///usr/share/backgrounds/warty-final-ubuntu.png").Run()
-		if err != nil {
+		if err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file:///usr/share/backgrounds/warty-final-ubuntu.png").Run(); err != nil {
 			return "Wallpaper change failed: " + err.Error(), false
 		}
-	
+
 	}
-	return "Wallpaper changed successfully", true
+	return "Wallpaper changed to default successfully", true
+}
+
+// applyWallpaper sets the desktop wallpaper to the given local file path.
+func applyWallpaper(path string) (string, bool) {
+	switch runtime.GOOS {
+	case "windows":
+		script := fmt.Sprintf(
+			`Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'; [W]::SystemParametersInfo(20,0,"%s",3)`,
+			path,
+		)
+		if err := exec.Command("powershell", "-Command", script).Run(); err != nil {
+			return "Wallpaper failed: " + err.Error(), false
+		}
+	case "linux":
+		if err := exec.Command("gsettings", "set", "org.gnome.desktop.background", "picture-uri", "file://"+path).Run(); err != nil {
+			return "Wallpaper failed: " + err.Error(), false
+		}
+	
+	default:
+		return fmt.Sprintf("Unsupported OS: %s", runtime.GOOS), false
+	}
+	return fmt.Sprintf("Wallpaper applied successfully (%s)", path), true
 }
 
 func getSystemInfo() (string, bool) {
@@ -161,22 +218,72 @@ func runShell(command string) (string, bool) {
 	return string(output), true
 }
 
+// ─── mDNS registration ────────────────────────────────────────────────────────
+
+// registerMDNS advertises this agent on the local network so the controller
+// can discover it without any hardcoded IPs.
+// The instance name is the agentID (e.g. "Agent-1010").
+// Returns a cleanup function — call it on shutdown.
+func registerMDNS(port int) (func(), error) {
+	hostname, _ := os.Hostname()
+	server, err := zeroconf.Register(
+		agentID,      // instance name   → shown as Agent.ID on the controller
+		mdnsService,  // service type
+		mdnsDomain,   // domain
+		port,         // port
+		[]string{"version=1"}, // TXT records (optional metadata)
+		nil,          // bind to all interfaces
+	)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("[%s] mDNS registered as %q on %s:%d\n", agentID, agentID, hostname, port)
+	return func() { server.Shutdown() }, nil
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
 func main() {
-	port := "1010"
+	portStr := "1010"
 	if len(os.Args) > 1 {
-		port = os.Args[1]
+		portStr = os.Args[1]
 	}
 
-	agentID = "Agent-" + port
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		fmt.Println("Invalid port:", portStr)
+		os.Exit(1)
+	}
+
+	agentID = "Agent-" + portStr
+
+	stopMDNS, err := registerMDNS(port)
+	if err != nil {
+		fmt.Printf("[%s] WARNING: mDNS registration failed: %v\n", agentID, err)
+	} else {
+		defer stopMDNS()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/command", commandHandler)
 	mux.HandleFunc("/terminal", terminalHandler)
+	mux.HandleFunc("/wallpaper", wallpaperHandler)
 
-	fmt.Printf("[%s] Agent running on port %s\n", agentID, port)
+	fmt.Printf("[%s] Agent running on port %d\n", agentID, port)
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		fmt.Printf("\n[%s] Shutting down...\n", agentID)
+		if stopMDNS != nil {
+			stopMDNS()
+		}
+		os.Exit(0)
+	}()
 
 	server := &http.Server{
-		Addr:    ":" + port,
+		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 	}
 
